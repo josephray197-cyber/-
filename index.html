@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>指尖魔法</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; font-family: sans-serif; }
+  #c { position: fixed; top: 0; left: 0; width: 100%; height: 100%; }
+  #cam { position: fixed; bottom: 16px; left: 16px; width: 180px; height: 135px; border-radius: 10px; opacity: 0.5; object-fit: cover; transform: scaleX(-1); }
+  #fs-btn {
+    position: fixed; top: 14px; right: 14px; z-index: 999;
+    background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.25);
+    color: #fff; padding: 7px 14px; border-radius: 8px; cursor: pointer;
+    font-size: 13px; backdrop-filter: blur(6px); transition: background 0.2s;
+  }
+  #fs-btn:hover { background: rgba(255,255,255,0.22); }
+  #status {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+    color: rgba(255,255,255,0.3); font-size: 13px; pointer-events: none;
+    transition: opacity 0.5s;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" autoplay playsinline muted></video>
+<button id="fs-btn" onclick="toggleFS()">⛶ 全屏</button>
+<div id="status">✋ 伸出手指开始魔法</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+/* ─── Three.js 场景 ─── */
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 0, 22);
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+/* ─── 粒子字模 ─── */
+function getCharPoints(chars, density = 6) {
+  const offCtx = document.createElement('canvas');
+  const W = 300, H = 160;
+  offCtx.width = W; offCtx.height = H;
+  const ctx = offCtx.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${H * 0.72}px Arial`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(chars, W / 2, H / 2);
+  const data = ctx.getImageData(0, 0, W, H).data;
+  const pts = [];
+  for (let y = 0; y < H; y += density) {
+    for (let x = 0; x < W; x += density) {
+      if (data[(y * W + x) * 4 + 3] > 128) {
+        pts.push([(x - W / 2) / 14, -(y - H / 2) / 14, 0]);
+      }
+    }
+  }
+  return pts;
+}
+
+/* 双行文字粒子 */
+function getTwoLinePoints(line1, line2, density = 4) {
+  const W = 600, H = 220;
+  const offCtx = document.createElement('canvas');
+  offCtx.width = W; offCtx.height = H;
+  const ctx = offCtx.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 88px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(line1, W / 2, H * 0.3);
+  ctx.fillText(line2, W / 2, H * 0.76);
+  const data = ctx.getImageData(0, 0, W, H).data;
+  const pts = [];
+  for (let y = 0; y < H; y += density) {
+    for (let x = 0; x < W; x += density) {
+      if (data[(y * W + x) * 4 + 3] > 128) {
+        pts.push([(x - W / 2) / 22, -(y - H / 2) / 22, 0]);
+      }
+    }
+  }
+  return pts;
+}
+
+/* ─── 粒子系统 ─── */
+let particleMesh = null;
+let currentState = 'idle';
+let balloons = [], flowers = [], fireworks = [];
+let fireworkTimer = null;
+
+function clearScene() {
+  if (particleMesh) { scene.remove(particleMesh); particleMesh.geometry.dispose(); particleMesh = null; }
+  balloons.forEach(b => { scene.remove(b); b.geometry.dispose(); });
+  flowers.forEach(f => { scene.remove(f); f.geometry.dispose(); });
+  fireworks.forEach(fw => { if (fw.mesh) { scene.remove(fw.mesh); fw.mesh.geometry.dispose(); } });
+  balloons = []; flowers = []; fireworks = [];
+  if (fireworkTimer) { clearInterval(fireworkTimer); fireworkTimer = null; }
+}
+
+/* 多色粒子：每粒子独立颜色 */
+function buildParticles(pts, colorFn) {
+  clearScene();
+  const n = pts.length;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(n * 3);
+  const col = new Float32Array(n * 3);
+  const vel = new Float32Array(n * 3);
+  const tgt = new Float32Array(n * 3);
+
+  for (let i = 0; i < n; i++) {
+    pos[i*3]   = (Math.random()-0.5)*40;
+    pos[i*3+1] = (Math.random()-0.5)*40;
+    pos[i*3+2] = (Math.random()-0.5)*10;
+    tgt[i*3]   = pts[i][0]; tgt[i*3+1] = pts[i][1]; tgt[i*3+2] = pts[i][2];
+    vel[i*3] = vel[i*3+1] = vel[i*3+2] = 0;
+    const c = colorFn(i, n);
+    col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+  geo.userData = { vel, tgt };
+
+  const mat = new THREE.PointsMaterial({ size: 0.2, sizeAttenuation: true, vertexColors: true });
+  particleMesh = new THREE.Points(geo, mat);
+  scene.add(particleMesh);
+}
+
+/* 彩虹色函数 */
+function rainbowColor(i, n) {
+  const h = (i / n) * 360;
+  const c = new THREE.Color(); c.setHSL(h/360, 1.0, 0.65); return c;
+}
+/* 单色函数工厂 */
+function solidColor(hex) {
+  const c = new THREE.Color(hex);
+  return () => c;
+}
+
+const DIGIT_COLORS = { 1: 0x44ddff, 2: 0xffcc33, 3: 0xff55cc };
+
+function showDigit(d) {
+  if (currentState === d) return;
+  currentState = d;
+  const pts = getCharPoints(String(d), 5);
+  buildParticles(pts, solidColor(DIGIT_COLORS[d]));
+  setStatus('');
+}
+
+/* ─── 生日特效 ─── */
+function showLove() {
+  if (currentState === 'love') return;
+  currentState = 'love';
+
+  const pts = getTwoLinePoints('HAPPY', 'BIRTHDAY', 3);
+  buildParticles(pts, rainbowColor);
+
+  spawnBalloons();
+  spawnFlowers();
+  startFireworks();
+  setStatus('🎂🎉');
+}
+
+function spawnBalloons() {
+  const colors = [0xff3355, 0xff8800, 0xffdd00, 0x44ff88, 0x44ccff, 0xcc55ff, 0xff66aa, 0x00ffcc];
+  for (let i = 0; i < 40; i++) {
+    const r = 0.35 + Math.random() * 0.45;
+    const geo = new THREE.SphereGeometry(r, 12, 12);
+    const mat = new THREE.MeshBasicMaterial({ color: colors[i % colors.length] });
+    const b = new THREE.Mesh(geo, mat);
+    b.position.set((Math.random()-0.5)*32, -14 - Math.random()*10, (Math.random()-0.5)*6);
+    b.userData.vy    = 0.035 + Math.random()*0.045;
+    b.userData.vx    = (Math.random()-0.5)*0.012;
+    b.userData.swing = Math.random()*Math.PI*2;
+    scene.add(b); balloons.push(b);
+  }
+}
+
+function spawnFlowers() {
+  const colors = [0xff99cc, 0xff4488, 0xffee44, 0xffffff, 0xff77aa, 0xffbbdd, 0xee55ff, 0xffaa33];
+  for (let i = 0; i < 80; i++) {
+    const geo = new THREE.OctahedronGeometry(0.12 + Math.random()*0.12, 0);
+    const mat = new THREE.MeshBasicMaterial({ color: colors[i % colors.length] });
+    const f = new THREE.Mesh(geo, mat);
+    f.position.set((Math.random()-0.5)*36, 14 + Math.random()*12, (Math.random()-0.5)*7);
+    f.userData.vy = -(0.025 + Math.random()*0.055);
+    f.userData.vx = (Math.random()-0.5)*0.022;
+    f.userData.vr = (Math.random()-0.5)*0.09;
+    scene.add(f); flowers.push(f);
+  }
+}
+
+/* ─── 满屏烟花系统 ─── */
+function launchFirework() {
+  /* 发射点：满屏随机，包括边缘区域 */
+  const ox = (Math.random()-0.5)*30;
+  const oy = (Math.random()-0.5)*18;
+  const oz = (Math.random()-0.5)*4;
+  const count = 120 + Math.floor(Math.random()*80);
+  const hue = Math.random();
+
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count*3);
+  const col = new Float32Array(count*3);
+  const vel = [];
+
+  for (let i = 0; i < count; i++) {
+    pos[i*3] = ox; pos[i*3+1] = oy; pos[i*3+2] = oz;
+    /* 球形爆炸速度 */
+    const theta = Math.random()*Math.PI*2;
+    const phi   = Math.acos(2*Math.random()-1);
+    const spd   = 0.08 + Math.random()*0.22;
+    vel.push(
+      Math.sin(phi)*Math.cos(theta)*spd,
+      Math.sin(phi)*Math.sin(theta)*spd,
+      Math.cos(phi)*spd*0.5
+    );
+    const c = new THREE.Color(); c.setHSL(hue + (Math.random()-0.5)*0.15, 1.0, 0.6);
+    col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(col, 3));
+  const mat = new THREE.PointsMaterial({ size: 0.18, sizeAttenuation: true, vertexColors: true });
+  const mesh = new THREE.Points(geo, mat);
+  scene.add(mesh);
+  fireworks.push({ mesh, vel, life: 1.0, count });
+}
+
+function startFireworks() {
+  /* 立即爆 6 发，之后每 320ms 爆 2 发 */
+  for (let i = 0; i < 6; i++) setTimeout(launchFirework, i*80);
+  fireworkTimer = setInterval(() => {
+    if (currentState !== 'love') return;
+    launchFirework();
+    setTimeout(launchFirework, 120);
+  }, 320);
+}
+
+function resetIdle() {
+  currentState = 'idle';
+  clearScene();
+  lastTriggered = '';
+  gestureBuffer = [];
+  setStatus('✋ 伸出手指开始魔法');
+}
+
+/* ─── 动画循环 ─── */
+function animate() {
+  requestAnimationFrame(animate);
+
+  /* 文字粒子弹簧聚合 */
+  if (particleMesh) {
+    const geo = particleMesh.geometry;
+    const pos = geo.attributes.position.array;
+    const { vel, tgt } = geo.userData;
+    const n = pos.length / 3;
+    const spring = 0.08, damp = 0.76;
+    for (let i = 0; i < n; i++) {
+      const ix = i*3, iy = ix+1, iz = ix+2;
+      vel[ix] += (tgt[ix]-pos[ix])*spring; vel[iy] += (tgt[iy]-pos[iy])*spring; vel[iz] += (tgt[iz]-pos[iz])*spring;
+      vel[ix] *= damp; vel[iy] *= damp; vel[iz] *= damp;
+      pos[ix] += vel[ix]; pos[iy] += vel[iy]; pos[iz] += vel[iz];
+    }
+    geo.attributes.position.needsUpdate = true;
+    particleMesh.rotation.y = Math.sin(Date.now()*0.0003)*0.1;
+  }
+
+  /* 气球上升 */
+  balloons.forEach(b => {
+    b.userData.swing += 0.018;
+    b.position.y += b.userData.vy;
+    b.position.x += b.userData.vx + Math.sin(b.userData.swing)*0.007;
+    if (b.position.y > 16) b.position.y = -15;
+  });
+
+  /* 花瓣飘落 */
+  flowers.forEach(f => {
+    f.position.y += f.userData.vy;
+    f.position.x += f.userData.vx + Math.sin(Date.now()*0.001 + f.userData.vr*10)*0.005;
+    f.rotation.z += f.userData.vr;
+    f.rotation.x += f.userData.vr * 0.5;
+    if (f.position.y < -15) f.position.y = 15;
+  });
+
+  /* 烟花消散 */
+  for (let fi = fireworks.length-1; fi >= 0; fi--) {
+    const fw = fireworks[fi];
+    fw.life -= 0.012;
+    if (fw.life <= 0) {
+      scene.remove(fw.mesh); fw.mesh.geometry.dispose();
+      fireworks.splice(fi, 1); continue;
+    }
+    const pos = fw.mesh.geometry.attributes.position.array;
+    const fade = fw.life;
+    fw.mesh.material.opacity = fade;
+    fw.mesh.material.transparent = true;
+    for (let i = 0; i < fw.count; i++) {
+      pos[i*3]   += fw.vel[i*3]   * fade;
+      pos[i*3+1] += fw.vel[i*3+1] * fade - 0.003; /* 重力 */
+      pos[i*3+2] += fw.vel[i*3+2] * fade;
+    }
+    fw.mesh.geometry.attributes.position.needsUpdate = true;
+  }
+
+  renderer.render(scene, camera);
+}
+animate();
+
+/* ─── MediaPipe 手势检测 ─── */
+/*
+  MediaPipe landmark indices:
+  Thumb:  0(wrist) 1 2 3 4(tip)
+  Index:  5(mcp) 6(pip) 7(dip) 8(tip)
+  Middle: 9 10 11 12
+  Ring:   13 14 15 16
+  Pinky:  17 18 19 20
+  用 tip 与 pip(第二关节) 的 y 对比判断伸直/弯曲
+  y 轴：屏幕向下为正，手指伸直时 tip.y < pip.y
+*/
+function isFingerExtended(lm, tipIdx, pipIdx) {
+  return lm[tipIdx].y < lm[pipIdx].y - 0.02;
+}
+
+function isThumbExtended(lm) {
+  /* 拇指用 tip(4) 与 ip(3) 的 x 距离，同时参考 mcp(2) 避免握拳误判 */
+  const dx = Math.abs(lm[4].x - lm[3].x);
+  const dy = Math.abs(lm[4].y - lm[3].y);
+  /* 拇指伸出时与手掌有较大横向或纵向距离 */
+  return Math.sqrt(dx * dx + dy * dy) > 0.055;
+}
+
+function classifyHand(lm) {
+  /* 四指伸直状态 */
+  const idx  = isFingerExtended(lm, 8, 6);
+  const mid  = isFingerExtended(lm, 12, 10);
+  const ring = isFingerExtended(lm, 16, 14);
+  const pink = isFingerExtended(lm, 20, 18);
+  const thu  = isThumbExtended(lm);
+
+  const extended = [thu, idx, mid, ring, pink].filter(Boolean).length;
+
+  /* 握拳：四指全部弯曲 */
+  const fist = !idx && !mid && !ring && !pink;
+
+  return { extended, fist, idx, mid, ring, pink, thu };
+}
+
+/* 稳定滑动窗口：连续 N 帧一致才触发 */
+const STABLE_FRAMES = 5;
+let gestureBuffer = [];
+let lastTriggered = '';
+
+function handleGesture(state) {
+  const key = state.fist ? 'fist'
+    : state.extended === 5 ? 'love'
+    : state.extended >= 1 && state.extended <= 3 ? String(state.extended)
+    : 'other';
+
+  gestureBuffer.push(key);
+  if (gestureBuffer.length > STABLE_FRAMES) gestureBuffer.shift();
+
+  /* 全部相同才认定为稳定手势 */
+  const stable = gestureBuffer.every(k => k === key);
+  if (!stable || key === lastTriggered) return;
+  if (key === 'other') return;
+
+  lastTriggered = key;
+  if (key === 'fist')  { resetIdle(); return; }
+  if (key === 'love')  { showLove();  return; }
+  showDigit(parseInt(key));
+}
+
+/* 实时状态调试提示（轻量，不影响体验） */
+function updateDebugStatus(state) {
+  const icons = { thu: '👍', idx: '☝️', mid: '🖕', ring: '💍', pink: '🤙' };
+  const active = ['idx','mid','ring','pink','thu'].filter(k => state[k]).map(k => icons[k]).join('');
+  const hint = state.fist ? '✊ 握拳' : state.extended === 5 ? '🖐️ 五指' : active ? `${active} ×${state.extended}` : '——';
+  if (currentState === 'idle') setStatus(hint || '✋ 伸出手指开始魔法');
+}
+
+const videoEl = document.getElementById('cam');
+
+const hands = new Hands({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+});
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 0,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.6
+});
+
+hands.onResults(results => {
+  if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
+    gestureBuffer = [];
+    return;
+  }
+  const lm = results.multiHandLandmarks[0];
+  const state = classifyHand(lm);
+  updateDebugStatus(state);
+  handleGesture(state);
+});
+
+const mpCamera = new Camera(videoEl, {
+  onFrame: async () => { await hands.send({ image: videoEl }); },
+  width: 320, height: 240
+});
+mpCamera.start();
+
+/* ─── 全屏 ─── */
+function toggleFS() {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+  else document.exitFullscreen();
+}
+
+function setStatus(t) {
+  document.getElementById('status').textContent = t;
+}
+</script>
+</body>
+</html>
